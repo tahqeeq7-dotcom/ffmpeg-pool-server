@@ -184,9 +184,9 @@ async function processTask(task) {
     const concatLabels = [];
     let inputIdx = 0;
 
-    if (hasHook) { ffmpegArgs.push('-i', path.join(taskDir, 'hook.mp4')); concatLabels.push('[' + inputIdx + ':v]'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++; }
-    ffmpegArgs.push('-i', path.join(taskDir, 'content.mp4')); concatLabels.push('[' + inputIdx + ':v]'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++;
-    if (hasOutro) { ffmpegArgs.push('-i', path.join(taskDir, 'outro.mp4')); concatLabels.push('[' + inputIdx + ':v]'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++; }
+    if (hasHook) { ffmpegArgs.push('-i', path.join(taskDir, 'hook.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++; }
+    ffmpegArgs.push('-i', path.join(taskDir, 'content.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++;
+    if (hasOutro) { ffmpegArgs.push('-i', path.join(taskDir, 'outro.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++; }
 
     const n = concatLabels.length;
     filters.push(concatLabels.join('') + 'concat=n=' + n + ':v=1:a=0[base]');
