@@ -96,7 +96,7 @@ function runFFmpeg(args, timeoutSecs, taskId) {
     const child = execFile(FFMPEG_BIN, args, { timeout: timeoutSecs * 1000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         if (err.killed) return reject(new Error('FFmpeg timeout ' + timeoutSecs + 's'));
-        return reject(new Error((stderr || '').substring(0, 1500)));
+        return reject(new Error((stderr || '').substring(0, 10000)));
       }
       resolve();
     });
