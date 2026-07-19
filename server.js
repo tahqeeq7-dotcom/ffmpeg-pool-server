@@ -6,15 +6,19 @@ const os = require('os');
 const { execFile } = require('child_process');
 const https = require('https');
 const { URL } = require('url');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
-const TMP_DIR = '/data/data/com.termux/files/home/.ffmpeg-tmp';
-const FFMPEG_BIN = 'ffmpeg';
+const TMP_DIR = process.env.FFMPEG_TMP_DIR || '/data/data/com.termux/files/home/.ffmpeg-tmp';
+const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const MEM_PER_WORKER = 350;
 const RESERVE_MB = 512;
+const MAX_QUEUE_LENGTH = 50;
+const IDEMPOTENCY_FILE = path.join(TMP_DIR, '.completed_tasks.json');
 
 let vidsToday = 0;
 const todayStr = () => new Date().toISOString().substring(0, 10);
@@ -26,6 +30,36 @@ const progressMap = {};
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
+// ─── Auth middleware ─────────────────────────────────────────
+function authMiddleware(req, res, next) {
+  if (!AUTH_TOKEN) return next();
+  const token = req.headers['x-api-key'];
+  if (!token || token !== AUTH_TOKEN) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  next();
+}
+app.use(authMiddleware);
+
+// ─── Idempotency (track completed taskIds to prevent dupes) ──
+function loadCompletedTasks() {
+  try {
+    if (fs.existsSync(IDEMPOTENCY_FILE)) {
+      return JSON.parse(fs.readFileSync(IDEMPOTENCY_FILE, 'utf8'));
+    }
+  } catch (_) {}
+  return {};
+}
+
+function saveCompletedTasks(map) {
+  try {
+    const dir = path.dirname(IDEMPOTENCY_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(IDEMPOTENCY_FILE, JSON.stringify(map));
+  } catch (_) {}
+}
+
+// ─── Helpers ─────────────────────────────────────────────────
 function setProgress(id, step, pct) {
   progressMap[id] = { step, progress: pct, updatedAt: Date.now() };
 }
@@ -42,7 +76,7 @@ function getMaxWorkers() {
   return Math.min(byRAM, byCPU, 6);
 }
 
-function downloadFile(urlStr, destPath, taskId) {
+function downloadFile(urlStr, destPath, taskId, { fileId, apiKey } = {}) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
     const parsed = new URL(urlStr);
@@ -60,14 +94,20 @@ function downloadFile(urlStr, destPath, taskId) {
         file.close(); fs.unlink(destPath, () => {});
         return downloadFile(res.headers.location, destPath, taskId).then(resolve).catch(reject);
       }
-      if (res.statusCode !== 200) {
+      // If download fails or returns HTML, attempt shortcut resolution
+      if (res.statusCode !== 200 || (res.headers['content-type'] || '').includes('text/html')) {
         file.close(); fs.unlink(destPath, () => {});
-        return reject(new Error('HTTP ' + res.statusCode));
-      }
-      const ct = res.headers['content-type'] || '';
-      if (ct.includes('text/html')) {
-        file.close(); fs.unlink(destPath, () => {});
-        return reject(new Error('HTML response - check API key'));
+        if (fileId && apiKey) {
+          return resolveShortcut(fileId, apiKey).then((resolvedId) => {
+            if (resolvedId !== fileId) {
+              const newUrl = driveUrl(resolvedId, apiKey);
+              console.log('Resolved shortcut', fileId, '->', resolvedId, 'retrying download');
+              return downloadFile(newUrl, destPath, taskId).then(resolve).catch(reject);
+            }
+            reject(new Error(res.statusCode !== 200 ? 'HTTP ' + res.statusCode : 'HTML response'));
+          }).catch(() => reject(new Error(res.statusCode !== 200 ? 'HTTP ' + res.statusCode : 'HTML response')));
+        }
+        return reject(new Error(res.statusCode !== 200 ? 'HTTP ' + res.statusCode : 'HTML response'));
       }
       const cl = parseInt(res.headers['content-length']) || 0;
       res.pipe(file);
@@ -89,6 +129,33 @@ function downloadFile(urlStr, destPath, taskId) {
 
 function driveUrl(fileId, apiKey) {
   return 'https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media&key=' + apiKey;
+}
+
+// Resolve a Google Drive shortcut to its target file ID.
+// Makes a HEAD-like GET to check mimeType; if it's a shortcut, fetches metadata to get targetId.
+function resolveShortcut(fileId, apiKey) {
+  return new Promise((resolve, reject) => {
+    const url = 'https://www.googleapis.com/drive/v3/files/' + fileId + '?fields=mimeType,shortcutDetails(targetId,targetMimeType)&key=' + apiKey;
+    https.get(url, (res) => {
+      let body = '';
+      res.on('data', (chunk) => body += chunk);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.mimeType === 'application/vnd.google-apps.shortcut' && data.shortcutDetails) {
+            const target = data.shortcutDetails.targetId;
+            const targetMime = data.shortcutDetails.targetMimeType || '';
+            if (targetMime.includes('video/')) {
+              console.log('Resolved shortcut', fileId, '->', target);
+              return resolve(target);
+            }
+          }
+          // Not a shortcut, or not a video shortcut — return original
+          resolve(fileId);
+        } catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
 }
 
 function runFFmpeg(args, timeoutSecs, taskId) {
@@ -128,11 +195,14 @@ async function uploadToYouTube(videoPath, thumbPath, opts, taskId) {
   const title = (lines[0] || 'Untitled').substring(0, 100);
   const description = lines.slice(1).join('\n').trim();
 
+  // Detect language from caption content (simple heuristic: if description has non-ASCII chars, keep 'en' as default)
+  const lang = opts.language || 'en';
+
   const upRes = await youtube.videos.insert({
     part: ['snippet', 'status'],
     notifySubscribers: false,
     requestBody: {
-      snippet: { title, description, tags: ['Shorts'], defaultLanguage: 'en' },
+      snippet: { title, description, tags: ['Shorts'], defaultLanguage: lang },
       status: { privacyStatus: 'public', selfDeclaredMadeForKids: false },
     },
     media: { body: fs.createReadStream(videoPath) },
@@ -151,26 +221,74 @@ async function uploadToYouTube(videoPath, thumbPath, opts, taskId) {
   return videoId;
 }
 
+// Generate random burst parameters for content uniqueness
+function generateBurstParams(seed) {
+  const rng = seedrandom(seed);
+  const burstDuration = 3 + rng() * 1.5; // 3-4.5s burst window
+  const burstStart = 10 + rng() * 35;    // between 10s and 45s into video
+  const burstEnd = burstStart + burstDuration;
+  const speedFactor = 0.94 + rng() * 0.08; // 0.94-1.02 (or 1.0 to 1.06 via division)
+  const speedMode = rng() > 0.5 ? 'slow' : 'fast';
+  // slow -> PTS/{speedFactor} where speedFactor >1 (e.g. 1.03 = slower)
+  // fast -> PTS/{speedFactor} where speedFactor <1 (e.g. 0.97 = faster)
+  // But FFmpeg setpts: PTS * factor where factor <1 speeds up, factor >1 slows down
+  // We use division: PTS/{divisor} where divisor >1 speeds up, divisor <1 slows down
+  const speedDivisor = speedMode === 'fast' ? (1 / (0.94 + rng() * 0.04)) : (0.98 + rng() * 0.04);
+  const colorTemp = -0.08 + rng() * 0.16; // -0.08 to +0.08
+  const vignetteVal = 0.05 + rng() * 0.10; // 0.05-0.15
+  const pitchShift = 0.97 + rng() * 0.06; // 0.97-1.03
+  const asetrateVal = Math.round(44100 * pitchShift);
+  const atempoVal = +(1 / pitchShift).toFixed(4);
+  return { burstStart, burstEnd, speedDivisor, colorTemp, vignetteVal, asetrateVal, atempoVal, burstDuration };
+}
+
+// Seeded random (simple mulberry32)
+function seedrandom(seed) {
+  let s = seed | 0;
+  return function() {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 async function processTask(task) {
-  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, logoFileId, logoIsVideo, youtube } = task;
+  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, logoFileId, logoIsVideo, youtube, skipDownload, localVideoPath, randomize, randomSeed } = task;
   const taskDir = path.join(TMP_DIR, 'task_' + taskId);
 
   try {
+    // Check idempotency: if this taskId was already completed, skip re-processing
+    const completed = loadCompletedTasks();
+    if (completed[taskId]) {
+      console.log('Skipping already-completed task', taskId, 'videoId:', completed[taskId]);
+      return { success: true, taskId, videoId: completed[taskId] };
+    }
+
     fs.mkdirSync(taskDir, { recursive: true });
     setProgress(taskId, 'downloading', 0);
 
-    const downloads = [];
-    downloads.push({ key: 'content', url: driveUrl(contentFileId, driveApiKey), file: path.join(taskDir, 'content.mp4') });
-    if (hookFileId) downloads.push({ key: 'hook', url: driveUrl(hookFileId, driveApiKey), file: path.join(taskDir, 'hook.mp4') });
-    if (outroFileId) downloads.push({ key: 'outro', url: driveUrl(outroFileId, driveApiKey), file: path.join(taskDir, 'outro.mp4') });
-    if (watermarkFileId) {
-      downloads.push({ key: 'wm', url: driveUrl(watermarkFileId, driveApiKey), file: path.join(taskDir, 'wm.mp4') });
-    }
-    if (logoFileId) {
-      downloads.push({ key: 'logo', url: driveUrl(logoFileId, driveApiKey), file: path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png')) });
-    }
+    if (skipDownload) {
+      // Upload-only mode: video already exists locally, link it into taskDir
+      const contentSrc = localVideoPath || path.join(TMP_DIR, taskId, 'content.mp4');
+      if (fs.existsSync(contentSrc)) {
+        try { fs.linkSync(contentSrc, path.join(taskDir, 'content.mp4')); } catch (_) { fs.copyFileSync(contentSrc, path.join(taskDir, 'content.mp4')); }
+        console.log('Skip-download: using local file', contentSrc);
+      }
+    } else {
+      const downloads = [];
+      downloads.push({ key: 'content', url: driveUrl(contentFileId, driveApiKey), file: path.join(taskDir, 'content.mp4'), fileId: contentFileId });
+      if (hookFileId) downloads.push({ key: 'hook', url: driveUrl(hookFileId, driveApiKey), file: path.join(taskDir, 'hook.mp4'), fileId: hookFileId });
+      if (outroFileId) downloads.push({ key: 'outro', url: driveUrl(outroFileId, driveApiKey), file: path.join(taskDir, 'outro.mp4'), fileId: outroFileId });
+      if (watermarkFileId) {
+        downloads.push({ key: 'wm', url: driveUrl(watermarkFileId, driveApiKey), file: path.join(taskDir, 'wm.mp4'), fileId: watermarkFileId });
+      }
+      if (logoFileId) {
+        downloads.push({ key: 'logo', url: driveUrl(logoFileId, driveApiKey), file: path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png')), fileId: logoFileId });
+      }
 
-    for (const d of downloads) if (d.url) await downloadFile(d.url, d.file, taskId);
+      for (const d of downloads) if (d.url) await downloadFile(d.url, d.file, taskId, { fileId: d.fileId, apiKey: driveApiKey });
+    }
 
     const hasHook = hookFileId && fs.existsSync(path.join(taskDir, 'hook.mp4'));
     const hasOutro = outroFileId && fs.existsSync(path.join(taskDir, 'outro.mp4'));
@@ -196,7 +314,11 @@ async function processTask(task) {
     if (hasWm) {
       ffmpegArgs.push('-loop', '1', '-i', path.join(taskDir, 'wm.mp4'));
       filters.push('[' + inputIdx + ':v]scale=120:-1,format=rgba,colorchannelmixer=aa=0.15[wm]');
-      filters.push(current + '[wm]overlay=main_w-overlay_w-15:main_h-overlay_h-15:shortest=1[ow]');
+      // DVD-style bounce: triangle wave between 15px and bottom-right corner
+      // Uses n (frame counter) and addition instead of * to avoid FFmpeg 8.1.2 bug
+      const wmX = 'main_w-overlay_w-15-abs(mod(n+main_w-overlay_w-15,(main_w-overlay_w-30)+(main_w-overlay_w-30))-(main_w-overlay_w-30))';
+      const wmY = 'main_h-overlay_h-15-abs(mod(n+n+main_h-overlay_h-15,(main_h-overlay_h-30)+(main_h-overlay_h-30))-(main_h-overlay_h-30))';
+      filters.push(current + '[wm]overlay=' + wmX + ':' + wmY + ':shortest=1[ow]');
       current = '[ow]';
       inputIdx++;
     }
@@ -210,6 +332,38 @@ async function processTask(task) {
       inputIdx++;
     }
 
+    // Random content uniqueness burst (3-4s window)
+    if (randomize) {
+      const seed = randomSeed || Math.floor(Math.random() * 999999);
+      const bp = generateBurstParams(seed);
+      const { burstStart, burstEnd, speedDivisor, colorTemp, vignetteVal } = bp;
+
+      // Speed burst: setpts division works around the * bug
+      const speedFilter = current + 'setpts=PTS/' + speedDivisor.toFixed(4) + '[sp]';
+      filters.push(speedFilter);
+
+      // Color temp burst
+      const tempFilter = '[sp]eq=color_temperature=' + colorTemp.toFixed(4) + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct]';
+      filters.push(tempFilter);
+
+      // Vignette burst (PI/4 angle, variable amount)
+      const vigFilter = '[ct]vignette=PI/4:' + vignetteVal.toFixed(4) + ':eval=frame:enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[vg]';
+      filters.push(vigFilter);
+
+      // Text overlay (one auto-generated line from caption, centered)
+      const captionLines = (youtube.caption || '').trim().split('\n');
+      const textLine = (captionLines.length > 1 ? captionLines[Math.floor(Math.random() * captionLines.length)] : captionLines[0] || '✨').substring(0, 50);
+      // Escape single quotes in text for FFmpeg drawtext
+      const safeText = textLine.replace(/'/g, "'\\\\\\''").replace(/"/g, '\\"');
+      const txtFilter = '[vg]drawtext=text=\'' + safeText + '\':x=(w-text_w)/2:y=h*0.4:fontsize=28:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[tx]';
+      filters.push(txtFilter);
+
+      current = '[tx]';
+
+      // Global audio pitch shift (imperceptible ±3%, breaks audio fingerprint permanently)
+      ffmpegArgs.push('-af', 'asetrate=' + bp.asetrateVal + ',atempo=' + bp.atempoVal);
+    }
+
     ffmpegArgs.push('-filter_complex', filters.join(';'));
     ffmpegArgs.push('-map', '[' + current.replace('[', '').replace(']', '') + ']');
     ffmpegArgs.push('-map', contentAudioIdx + ':a?');
@@ -220,9 +374,15 @@ async function processTask(task) {
 
     setProgress(taskId, 'processing', 0.85);
     const thumbPath = path.join(taskDir, 'thumb.jpg');
-    try { await runFFmpeg(['-i', outputPath, '-ss', '00:00:01', '-vframes', '1', '-q:v', '2', thumbPath, '-y'], 30); } catch (_) {}
+    const thumbSec = randomize ? (2 + Math.floor(Math.random() * 5)).toString().padStart(2, '0') : '01';
+    try { await runFFmpeg(['-i', outputPath, '-ss', '00:00:' + thumbSec, '-vframes', '1', '-q:v', '2', thumbPath, '-y'], 30); } catch (_) {}
 
     const videoId = await uploadToYouTube(outputPath, fs.existsSync(thumbPath) ? thumbPath : null, youtube, taskId);
+
+    // Record completed task for idempotency BEFORE returning success
+    const completed = loadCompletedTasks();
+    completed[taskId] = videoId;
+    saveCompletedTasks(completed);
 
     try { fs.rmSync(taskDir, { recursive: true, force: true }); } catch (_) {}
     setProgress(taskId, 'done', 1.0);
@@ -235,22 +395,30 @@ async function processTask(task) {
 }
 
 async function processQueue() {
-  if (taskQueue.length === 0 || activeTasks >= getMaxWorkers()) return;
+  if (taskQueue.length === 0) return;
+  if (activeTasks >= getMaxWorkers()) return;
   const task = taskQueue.shift();
   activeTasks++;
-  const result = await processTask(task.data);
-  activeTasks--;
-  resetDaily();
-  if (result.success) vidsToday++;
-  if (task.resolve) task.resolve(result);
+  try {
+    const result = await processTask(task.data);
+    if (result.success) vidsToday++;
+    if (task.resolve) task.resolve(result);
+  } catch (err) {
+    console.error('processTask catastrophic error:', err);
+    if (task.resolve) task.resolve({ success: false, taskId: task.data.taskId, error: 'Internal error: ' + err.message });
+  } finally {
+    activeTasks--;
+    resetDaily();
+  }
 
   if (taskQueue.length > 0 && activeTasks < getMaxWorkers()) {
-    processQueue();
+    setImmediate(() => processQueue());
   }
 
   setTimeout(() => { try { delete progressMap[task.data.taskId]; } catch (_) {} }, 30000);
 }
 
+// ─── HTTP Endpoints ──────────────────────────────────────────
 app.get('/health', (req, res) => {
   resetDaily();
   res.json({
@@ -271,9 +439,17 @@ app.get('/status/:taskId', (req, res) => {
 });
 
 app.post('/process', (req, res) => {
-  const { taskId } = req.body;
-  if (!taskId || !req.body.contentFileId || !req.body.driveApiKey || !req.body.youtube?.accessToken) {
-    return res.status(400).json({ success: false, taskId: taskId || '?', error: 'Missing required fields' });
+  const { taskId, skipDownload } = req.body;
+  if (!taskId || !req.body.youtube?.accessToken) {
+    return res.status(400).json({ success: false, taskId: taskId || '?', error: 'Missing required fields: taskId and youtube.accessToken are required' });
+  }
+  if (!skipDownload && (!req.body.contentFileId || !req.body.driveApiKey)) {
+    return res.status(400).json({ success: false, taskId: taskId || '?', error: 'Missing contentFileId and driveApiKey (or set skipDownload=true for upload-only)' });
+  }
+
+  // Reject if queue is full
+  if (taskQueue.length >= MAX_QUEUE_LENGTH) {
+    return res.status(429).json({ success: false, taskId, error: 'Server queue full (max ' + MAX_QUEUE_LENGTH + '). Try again later.' });
   }
 
   const resolver = new Promise((resolve) => {
@@ -284,9 +460,39 @@ app.post('/process', (req, res) => {
   resolver.then((result) => res.json(result));
 });
 
+// ─── Graceful shutdown ───────────────────────────────────────
+let shuttingDown = false;
+
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('Received ' + signal + '. Draining active tasks...');
+
+  const waitForDrain = setInterval(() => {
+    if (activeTasks === 0 && taskQueue.length === 0) {
+      clearInterval(waitForDrain);
+      console.log('All tasks complete. Exiting.');
+      process.exit(0);
+    }
+    console.log('Waiting... active:', activeTasks, 'queued:', taskQueue.length);
+  }, 2000);
+
+  // Force exit after 30 seconds regardless
+  setTimeout(() => {
+    console.log('Force exit after timeout.');
+    process.exit(1);
+  }, 30000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('uncaughtException', (err) => console.error('Uncaught:', err.message));
+process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
+
+// ─── Start server ────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log('FFmpeg pool server running on port ' + PORT);
+  console.log('Auth: ' + (AUTH_TOKEN ? 'enabled' : 'DISABLED (set AUTH_TOKEN env var)'));
   console.log('Max workers: ' + getMaxWorkers() + ' (based on ' + Math.round(os.freemem() / 1024 / 1024) + 'MB free RAM)');
+  console.log('Max queue: ' + MAX_QUEUE_LENGTH);
 });
-
-process.on('uncaughtException', (err) => console.error('Uncaught:', err.message));
