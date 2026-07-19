@@ -123,21 +123,32 @@ async function uploadToYouTube(videoPath, thumbPath, opts) {
 }
 
 async function processTask(task) {
-  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, logoFileId, logoIsVideo, youtube } = task;
+  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, logoFileId, logoIsVideo, youtube, watermarkLocalPath, logoLocalPath, localContentPath } = task;
   const taskDir = path.join(TMP_DIR, `task_${taskId}`);
 
   try {
     fs.mkdirSync(taskDir, { recursive: true });
 
-    const downloads = [
-      { key: 'content', url: driveUrl(contentFileId, driveApiKey), file: path.join(taskDir, 'content.mp4') },
-    ];
+    const downloads = [];
+    if (localContentPath) {
+      fs.copyFileSync(localContentPath, path.join(taskDir, 'content.mp4'));
+    } else {
+      downloads.push({ key: 'content', url: driveUrl(contentFileId, driveApiKey), file: path.join(taskDir, 'content.mp4') });
+    }
     if (hookFileId) downloads.push({ key: 'hook', url: driveUrl(hookFileId, driveApiKey), file: path.join(taskDir, 'hook.mp4') });
     if (outroFileId) downloads.push({ key: 'outro', url: driveUrl(outroFileId, driveApiKey), file: path.join(taskDir, 'outro.mp4') });
-    if (watermarkFileId) downloads.push({ key: 'wm', url: driveUrl(watermarkFileId, driveApiKey), file: path.join(taskDir, 'wm.mp4') });
-    if (logoFileId) downloads.push({ key: 'logo', url: driveUrl(logoFileId, driveApiKey), file: path.join(taskDir, `logo.${logoIsVideo ? 'mp4' : 'png'}`) });
+    if (watermarkFileId && watermarkLocalPath) {
+      fs.copyFileSync(watermarkLocalPath, path.join(taskDir, 'wm.mp4'));
+    } else if (watermarkFileId) {
+      downloads.push({ key: 'wm', url: driveUrl(watermarkFileId, driveApiKey), file: path.join(taskDir, 'wm.mp4') });
+    }
+    if (logoFileId && logoLocalPath) {
+      fs.copyFileSync(logoLocalPath, path.join(taskDir, `logo.${logoIsVideo ? 'mp4' : 'png'}`));
+    } else if (logoFileId) {
+      downloads.push({ key: 'logo', url: driveUrl(logoFileId, driveApiKey), file: path.join(taskDir, `logo.${logoIsVideo ? 'mp4' : 'png'}`) });
+    }
 
-    for (const d of downloads) await downloadFile(d.url, d.file);
+    for (const d of downloads) if (d.url) await downloadFile(d.url, d.file);
 
     const hasHook = hookFileId && fs.existsSync(path.join(taskDir, 'hook.mp4'));
     const hasOutro = outroFileId && fs.existsSync(path.join(taskDir, 'outro.mp4'));
