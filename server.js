@@ -191,11 +191,12 @@ async function processTask(task) {
     const n = concatLabels.length;
     filters.push(concatLabels.join('') + 'concat=n=' + n + ':v=1:a=0[base]');
 
+    const contentAudioIdx = hasHook ? 1 : 0;
     let current = '[base]';
     if (hasWm) {
-      ffmpegArgs.push('-i', path.join(taskDir, 'wm.mp4'));
+      ffmpegArgs.push('-loop', '1', '-i', path.join(taskDir, 'wm.mp4'));
       filters.push('[' + inputIdx + ':v]scale=iw*0.15:-1,format=rgba,colorchannelmixer=aa=0.15[wm]');
-      filters.push(current + '[wm]overlay=main_w-overlay_w-15:main_h-overlay_h-15:shortest=1[ow]');
+      filters.push(current + '[wm]overlay=x=W-w-15-abs(mod(t*120,2*(W-w-30))-(W-w-30)):y=H-h-15-abs(mod(t*80,2*(H-h-30))-(H-h-30)):shortest=1[ow]');
       current = '[ow]';
       inputIdx++;
     }
@@ -210,6 +211,8 @@ async function processTask(task) {
     }
 
     ffmpegArgs.push('-filter_complex', filters.join(';'));
+    ffmpegArgs.push('-map', '[' + current.replace('[', '').replace(']', '') + ']');
+    ffmpegArgs.push('-map', contentAudioIdx + ':a?');
     ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '28');
     ffmpegArgs.push('-c:a', 'aac', '-y', outputPath);
 
