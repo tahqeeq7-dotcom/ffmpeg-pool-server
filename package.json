@@ -1,0 +1,14 @@
+{
+  "name": "ffmpeg-pool-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Termux FFmpeg worker pool server - processes videos via Drive download, FFmpeg edit, YouTube upload",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "googleapis": "^134.0.0"
+  }
+}
