@@ -205,7 +205,7 @@ async function processTask(task) {
       if (logoIsVideo) ffmpegArgs.push('-stream_loop', '-1', '-i', logoFile);
       else ffmpegArgs.push('-loop', '1', '-i', logoFile);
       filters.push('[' + inputIdx + ':v]scale=66:-1[logo]');
-      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1');
+      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1[ol]');
       current = '[ol]';
       inputIdx++;
     }
