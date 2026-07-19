@@ -380,7 +380,6 @@ async function processTask(task) {
     const videoId = await uploadToYouTube(outputPath, fs.existsSync(thumbPath) ? thumbPath : null, youtube, taskId);
 
     // Record completed task for idempotency BEFORE returning success
-    const completed = loadCompletedTasks();
     completed[taskId] = videoId;
     saveCompletedTasks(completed);
 
