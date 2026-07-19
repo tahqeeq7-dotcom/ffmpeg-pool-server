@@ -194,8 +194,8 @@ async function processTask(task) {
     let current = '[base]';
     if (hasWm) {
       ffmpegArgs.push('-i', path.join(taskDir, 'wm.mp4'));
-      filters.push('[' + inputIdx + ':v]scale=W*0.15:-1,format=rgba,colorchannelmixer=aa=0.15[wm]');
-      filters.push(current + '[wm]overlay=W-w-15:H-h-15:shortest=1[ow]');
+      filters.push('[' + inputIdx + ':v]scale=iw*0.15:-1,format=rgba,colorchannelmixer=aa=0.15[wm]');
+      filters.push(current + '[wm]overlay=main_w-overlay_w-15:main_h-overlay_h-15:shortest=1[ow]');
       current = '[ow]';
       inputIdx++;
     }
@@ -204,7 +204,7 @@ async function processTask(task) {
       if (logoIsVideo) ffmpegArgs.push('-stream_loop', '-1', '-i', logoFile);
       else ffmpegArgs.push('-loop', '1', '-i', logoFile);
       filters.push('[' + inputIdx + ':v]scale=min(iw*0.12\\,66):-1[logo]');
-      filters.push(current + '[logo]overlay=W-w-10:10:shortest=1');
+      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1');
       current = '[ol]';
       inputIdx++;
     }
