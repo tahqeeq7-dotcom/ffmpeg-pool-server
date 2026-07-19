@@ -152,7 +152,7 @@ async function uploadToYouTube(videoPath, thumbPath, opts, taskId) {
 }
 
 async function processTask(task) {
-  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, logoFileId, logoIsVideo, youtube, watermarkLocalPath, logoLocalPath, localContentPath } = task;
+  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, logoFileId, logoIsVideo, youtube } = task;
   const taskDir = path.join(TMP_DIR, 'task_' + taskId);
 
   try {
@@ -160,21 +160,13 @@ async function processTask(task) {
     setProgress(taskId, 'downloading', 0);
 
     const downloads = [];
-    if (localContentPath) {
-      fs.copyFileSync(localContentPath, path.join(taskDir, 'content.mp4'));
-    } else {
-      downloads.push({ key: 'content', url: driveUrl(contentFileId, driveApiKey), file: path.join(taskDir, 'content.mp4') });
-    }
+    downloads.push({ key: 'content', url: driveUrl(contentFileId, driveApiKey), file: path.join(taskDir, 'content.mp4') });
     if (hookFileId) downloads.push({ key: 'hook', url: driveUrl(hookFileId, driveApiKey), file: path.join(taskDir, 'hook.mp4') });
     if (outroFileId) downloads.push({ key: 'outro', url: driveUrl(outroFileId, driveApiKey), file: path.join(taskDir, 'outro.mp4') });
-    if (watermarkFileId && watermarkLocalPath) {
-      fs.copyFileSync(watermarkLocalPath, path.join(taskDir, 'wm.mp4'));
-    } else if (watermarkFileId) {
+    if (watermarkFileId) {
       downloads.push({ key: 'wm', url: driveUrl(watermarkFileId, driveApiKey), file: path.join(taskDir, 'wm.mp4') });
     }
-    if (logoFileId && logoLocalPath) {
-      fs.copyFileSync(logoLocalPath, path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png')));
-    } else if (logoFileId) {
+    if (logoFileId) {
       downloads.push({ key: 'logo', url: driveUrl(logoFileId, driveApiKey), file: path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png')) });
     }
 
