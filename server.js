@@ -314,11 +314,10 @@ async function processTask(task) {
     if (hasWm) {
       ffmpegArgs.push('-loop', '1', '-i', path.join(taskDir, 'wm.mp4'));
       filters.push('[' + inputIdx + ':v]scale=120:-1,format=rgba,colorchannelmixer=aa=0.15[wm]');
-      // DVD-style bounce: triangle wave between 15px and bottom-right corner
-      // Uses n (frame counter) and addition instead of * to avoid FFmpeg 8.1.2 bug
-      const wmX = 'main_w-overlay_w-15-abs(mod(n+main_w-overlay_w-15,(main_w-overlay_w-30)+(main_w-overlay_w-30))-(main_w-overlay_w-30))';
-      const wmY = 'main_h-overlay_h-15-abs(mod(n+n+main_h-overlay_h-15,(main_h-overlay_h-30)+(main_h-overlay_h-30))-(main_h-overlay_h-30))';
-      filters.push(current + '[wm]overlay=' + wmX + ':' + wmY + ':shortest=1:enable=1[ow]');
+      // Diagonal drift: watermark slides across, wraps around
+      const wmX = 'mod(n*3,main_w+overlay_w)-overlay_w';
+      const wmY = 'mod(n*2,main_h+overlay_h)-overlay_h';
+      filters.push(current + '[wm]overlay=' + wmX + ':' + wmY + ':shortest=1,null[ow]');
       current = '[ow]';
       inputIdx++;
     }
@@ -326,8 +325,8 @@ async function processTask(task) {
       const logoFile = path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png'));
       if (logoIsVideo) ffmpegArgs.push('-stream_loop', '-1', '-i', logoFile);
       else ffmpegArgs.push('-loop', '1', '-i', logoFile);
-      filters.push('[' + inputIdx + ':v]scale=66:-1:eval=frame[logo]');
-      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1:enable=1[ol]');
+      filters.push('[' + inputIdx + ':v]scale=66:-1,null[logo]');
+      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1,null[ol]');
       current = '[ol]';
       inputIdx++;
     }
