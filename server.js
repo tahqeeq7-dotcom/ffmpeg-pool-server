@@ -318,7 +318,7 @@ async function processTask(task) {
       // Uses n (frame counter) and addition instead of * to avoid FFmpeg 8.1.2 bug
       const wmX = 'main_w-overlay_w-15-abs(mod(n+main_w-overlay_w-15,(main_w-overlay_w-30)+(main_w-overlay_w-30))-(main_w-overlay_w-30))';
       const wmY = 'main_h-overlay_h-15-abs(mod(n+n+main_h-overlay_h-15,(main_h-overlay_h-30)+(main_h-overlay_h-30))-(main_h-overlay_h-30))';
-      filters.push(current + '[wm]overlay=' + wmX + ':' + wmY + ':shortest=1[ow]');
+      filters.push(current + '[wm]overlay=' + wmX + ':' + wmY + ':shortest=1:enable=1[ow]');
       current = '[ow]';
       inputIdx++;
     }
@@ -326,8 +326,8 @@ async function processTask(task) {
       const logoFile = path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png'));
       if (logoIsVideo) ffmpegArgs.push('-stream_loop', '-1', '-i', logoFile);
       else ffmpegArgs.push('-loop', '1', '-i', logoFile);
-      filters.push('[' + inputIdx + ':v]scale=66:-1[logo]');
-      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1[ol]');
+      filters.push('[' + inputIdx + ':v]scale=66:-1:eval=frame[logo]');
+      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1:enable=1[ol]');
       current = '[ol]';
       inputIdx++;
     }
