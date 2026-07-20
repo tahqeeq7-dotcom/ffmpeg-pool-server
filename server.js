@@ -158,13 +158,18 @@ function resolveShortcut(fileId, apiKey) {
   });
 }
 
-function getVideoDimensions(filePath) {
+function probeMedia(filePath) {
   return new Promise((resolve, reject) => {
-    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', filePath], (err, stdout) => {
+    execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=index,codec_type,width,height', '-of', 'json', filePath], (err, stdout) => {
       if (err) return reject(err);
-      const [w, h] = (stdout || '').trim().split('x').map(Number);
-      if (!w || !h) return reject(new Error('Could not read dimensions for ' + filePath));
-      resolve({ width: w, height: h });
+      let data;
+      try { data = JSON.parse(stdout); } catch (e) { return reject(e); }
+      const streams = data.streams || [];
+      const vStream = streams.find((s) => s.codec_type === 'video');
+      const hasAudio = streams.some((s) => s.codec_type === 'audio');
+      const duration = parseFloat(data.format && data.format.duration) || 0;
+      if (!vStream) return reject(new Error('No video stream in ' + filePath));
+      resolve({ width: vStream.width, height: vStream.height, duration, hasAudio });
     });
   });
 }
@@ -310,7 +315,6 @@ async function processTask(task) {
     const outputPath = path.join(taskDir, 'output.mp4');
     const ffmpegArgs = [];
     const filters = [];
-    const concatLabels = [];
     let inputIdx = 0;
 
     // concat requires every input to share identical resolution + SAR. Clips coming from
@@ -318,19 +322,55 @@ async function processTask(task) {
     // "Input link ... parameters do not match the corresponding output link ... parameters".
     // Normalize everything to content.mp4's own dimensions: scale-to-fit, pad to exact
     // canvas, force SAR=1.
-    const { width: targetW, height: targetH } = await getVideoDimensions(path.join(taskDir, 'content.mp4'));
-    const normalize = (idx) =>
+    const contentInfo = await probeMedia(path.join(taskDir, 'content.mp4'));
+    const targetW = contentInfo.width, targetH = contentInfo.height;
+    const normalizeVideo = (idx) =>
       '[' + idx + ':v]scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
       'pad=' + targetW + ':' + targetH + ':(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,setpts=PTS-STARTPTS[v' + idx + ']';
 
-    if (hasHook) { ffmpegArgs.push('-i', path.join(taskDir, 'hook.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push(normalize(inputIdx)); inputIdx++; }
-    ffmpegArgs.push('-i', path.join(taskDir, 'content.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push(normalize(inputIdx)); inputIdx++;
-    if (hasOutro) { ffmpegArgs.push('-i', path.join(taskDir, 'outro.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push(normalize(inputIdx)); inputIdx++; }
+    // Audio must ride along with its own segment through concat too — mapping content's
+    // raw audio stream directly (old behavior) ignored the hook/outro entirely, so
+    // content's dialogue started at t=0 under the hook's video instead of after it.
+    // Segments with no audio track (common for hook/outro stingers) get silence of
+    // the correct duration so the concat filter's stream count still lines up.
+    const normalizeAudio = (idx, hasAudioTrack, duration) =>
+      hasAudioTrack
+        ? '[' + idx + ':a]asetpts=PTS-STARTPTS[a' + idx + ']'
+        : 'anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=' + duration.toFixed(3) + ',asetpts=PTS-STARTPTS[a' + idx + ']';
 
-    const n = concatLabels.length;
-    filters.push(concatLabels.join('') + 'concat=n=' + n + ':v=1:a=0[base]');
+    const segmentLabels = []; // interleaved [vN][aN] pairs, in concat's expected order
+    let totalDuration = 0;
 
-    const contentAudioIdx = hasHook ? 1 : 0;
+    if (hasHook) {
+      const hookInfo = await probeMedia(path.join(taskDir, 'hook.mp4'));
+      ffmpegArgs.push('-i', path.join(taskDir, 'hook.mp4'));
+      filters.push(normalizeVideo(inputIdx));
+      filters.push(normalizeAudio(inputIdx, hookInfo.hasAudio, hookInfo.duration));
+      segmentLabels.push('[v' + inputIdx + ']', '[a' + inputIdx + ']');
+      totalDuration += hookInfo.duration;
+      inputIdx++;
+    }
+
+    ffmpegArgs.push('-i', path.join(taskDir, 'content.mp4'));
+    filters.push(normalizeVideo(inputIdx));
+    filters.push(normalizeAudio(inputIdx, contentInfo.hasAudio, contentInfo.duration));
+    segmentLabels.push('[v' + inputIdx + ']', '[a' + inputIdx + ']');
+    totalDuration += contentInfo.duration;
+    inputIdx++;
+
+    if (hasOutro) {
+      const outroInfo = await probeMedia(path.join(taskDir, 'outro.mp4'));
+      ffmpegArgs.push('-i', path.join(taskDir, 'outro.mp4'));
+      filters.push(normalizeVideo(inputIdx));
+      filters.push(normalizeAudio(inputIdx, outroInfo.hasAudio, outroInfo.duration));
+      segmentLabels.push('[v' + inputIdx + ']', '[a' + inputIdx + ']');
+      totalDuration += outroInfo.duration;
+      inputIdx++;
+    }
+
+    const n = segmentLabels.length / 2;
+    filters.push(segmentLabels.join('') + 'concat=n=' + n + ':v=1:a=1[base][baseaudio]');
+    let currentAudio = '[baseaudio]';
     let current = '[base]';
     if (hasWm) {
       ffmpegArgs.push('-loop', '1', '-i', path.join(taskDir, 'wm.mp4'));
@@ -362,19 +402,28 @@ async function processTask(task) {
       inputIdx++;
     }
 
-    // Random content uniqueness burst (3-4s window)
+    // Random content uniqueness burst (3-4.5s window)
     if (randomize) {
       const seed = randomSeed || Math.floor(Math.random() * 999999);
       const bp = generateBurstParams(seed);
-      const { burstStart, burstEnd, speedDivisor, colorTemp, vignetteVal } = bp;
+      let { burstStart, burstEnd, speedDivisor, colorTemp, vignetteVal } = bp;
 
-      // Speed burst: setpts division works around the * bug
-      const speedFilter = current + 'setpts=PTS/' + speedDivisor.toFixed(4) + '[sp_pre]';
-      filters.push(speedFilter);
-      filters.push('[sp_pre]null[sp]');
+      // burstStart/burstEnd are randomized independent of actual video length — clamp
+      // them into the real timeline (with a small tail margin) so the trim/concat split
+      // below never asks for a range past the end of a short video.
+      const TAIL_MARGIN = 0.5;
+      const maxEnd = Math.max(TAIL_MARGIN, totalDuration - TAIL_MARGIN);
+      if (burstEnd > maxEnd) {
+        burstStart = Math.max(0, burstStart - (burstEnd - maxEnd));
+        burstEnd = maxEnd;
+      }
+      const skipBurstSplit = burstEnd - burstStart < 0.3; // video too short for a meaningful window
+
+      const bStart = burstStart.toFixed(3);
+      const bEnd = burstEnd.toFixed(3);
 
       // Color temp burst
-      const tempFilter = '[sp]eq=color_temperature=' + colorTemp.toFixed(4) + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct_pre]';
+      const tempFilter = current + 'eq=color_temperature=' + colorTemp.toFixed(4) + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct_pre]';
       filters.push(tempFilter);
       filters.push('[ct_pre]null[ct]');
 
@@ -392,15 +441,38 @@ async function processTask(task) {
       filters.push(txtFilter);
       filters.push('[tx_pre]null[tx]');
 
-      current = '[tx]';
+      if (skipBurstSplit) {
+        // Video too short for a meaningful speed-change window — keep color/vignette/
+        // text (still gated by enable=between above) but don't retime anything.
+        current = '[tx]';
+      } else {
+        // Speed change, WINDOWED: eq/vignette/drawtext above use enable= to gate per-frame,
+        // but setpts/atempo are timing remaps — they can't be turned on/off per frame the
+        // same way. To actually confine the speed shift to just the burst window (instead
+        // of retiming the whole clip), split video+audio into pre/burst/post segments,
+        // only retime the burst segment, then concat back together. Times above (eq/
+        // vignette/drawtext) are evaluated BEFORE this split, against the original
+        // timeline, so their windows still line up correctly with burstStart/burstEnd.
+        filters.push('[tx]split=3[vsA][vsB][vsC]');
+        filters.push('[vsA]trim=start=0:end=' + bStart + ',setpts=PTS-STARTPTS[vpre]');
+        filters.push('[vsB]trim=start=' + bStart + ':end=' + bEnd + ',setpts=(PTS-STARTPTS)/' + speedDivisor.toFixed(4) + '[vburst]');
+        filters.push('[vsC]trim=start=' + bEnd + ',setpts=PTS-STARTPTS[vpost]');
+        filters.push('[vpre][vburst][vpost]concat=n=3:v=1:a=0[vout]');
+        current = '[vout]';
 
-      // Global audio pitch shift (imperceptible ±3%, breaks audio fingerprint permanently)
-      ffmpegArgs.push('-af', 'asetrate=' + bp.asetrateVal + ',atempo=' + bp.atempoVal);
+        // Audio pitch shift (imperceptible ±3%, breaks audio fingerprint), same windowing.
+        filters.push(currentAudio + 'asplit=3[asA][asB][asC]');
+        filters.push('[asA]atrim=start=0:end=' + bStart + ',asetpts=PTS-STARTPTS[apre]');
+        filters.push('[asB]atrim=start=' + bStart + ':end=' + bEnd + ',asetrate=' + bp.asetrateVal + ',atempo=' + bp.atempoVal + ',asetpts=PTS-STARTPTS[aburst]');
+        filters.push('[asC]atrim=start=' + bEnd + ',asetpts=PTS-STARTPTS[apost]');
+        filters.push('[apre][aburst][apost]concat=n=3:v=0:a=1[aout]');
+        currentAudio = '[aout]';
+      }
     }
 
     ffmpegArgs.push('-filter_complex', filters.join(';'));
     ffmpegArgs.push('-map', '[' + current.replace('[', '').replace(']', '') + ']');
-    ffmpegArgs.push('-map', contentAudioIdx + ':a?');
+    ffmpegArgs.push('-map', '[' + currentAudio.replace('[', '').replace(']', '') + ']');
     ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '28');
     ffmpegArgs.push('-c:a', 'aac', '-y', outputPath);
 
