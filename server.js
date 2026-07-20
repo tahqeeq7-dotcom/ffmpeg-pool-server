@@ -313,11 +313,19 @@ async function processTask(task) {
     let current = '[base]';
     if (hasWm) {
       ffmpegArgs.push('-loop', '1', '-i', path.join(taskDir, 'wm.mp4'));
-      filters.push('[' + inputIdx + ':v]scale=120:-1,format=rgba,colorchannelmixer=aa=0.15[wm]');
-      // Diagonal drift: watermark slides across, wraps around
-      const wmX = 'mod(n*3,main_w+overlay_w)-overlay_w';
-      const wmY = 'mod(n*2,main_h+overlay_h)-overlay_h';
-      filters.push(current + '[wm]overlay=' + wmX + ':' + wmY + ':shortest=1,null[ow]');
+      filters.push('[' + inputIdx + ':v]scale=120:-1,format=rgba,colorchannelmixer=aa=0.15[wm_pre]');
+      filters.push('[wm_pre]null[wm]');
+      // DVD-logo bounce: true reflection off each edge (triangle wave), not a wrap/drift.
+      // VX/VY are px/sec speeds; tweak to taste.
+      const VX = 90, VY = 60;
+      const wmX = "trunc(abs(mod(t*" + VX + "\\,2*(main_w-overlay_w))-(main_w-overlay_w)))";
+      const wmY = "trunc(abs(mod(t*" + VY + "\\,2*(main_h-overlay_h))-(main_h-overlay_h)))";
+      // End this filter statement BEFORE the output label (semicolon, not comma) —
+      // chaining a label straight onto a bare numeric option value (e.g. "shortest=1[ow]"
+      // or "shortest=1,null[ow]") is what was crashing the parser. A ';' starts a clean
+      // new filterchain so there's no ambiguous trailing token.
+      filters.push(current + "[wm]overlay=x='" + wmX + "':y='" + wmY + "':eval=frame:shortest=1[ow_pre]");
+      filters.push('[ow_pre]null[ow]');
       current = '[ow]';
       inputIdx++;
     }
@@ -325,8 +333,10 @@ async function processTask(task) {
       const logoFile = path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png'));
       if (logoIsVideo) ffmpegArgs.push('-stream_loop', '-1', '-i', logoFile);
       else ffmpegArgs.push('-loop', '1', '-i', logoFile);
-      filters.push('[' + inputIdx + ':v]scale=66:-1,null[logo]');
-      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1,null[ol]');
+      filters.push('[' + inputIdx + ':v]scale=66:-1[logo_pre]');
+      filters.push('[logo_pre]null[logo]');
+      filters.push(current + '[logo]overlay=main_w-overlay_w-10:10:shortest=1[ol_pre]');
+      filters.push('[ol_pre]null[ol]');
       current = '[ol]';
       inputIdx++;
     }
@@ -338,24 +348,28 @@ async function processTask(task) {
       const { burstStart, burstEnd, speedDivisor, colorTemp, vignetteVal } = bp;
 
       // Speed burst: setpts division works around the * bug
-      const speedFilter = current + 'setpts=PTS/' + speedDivisor.toFixed(4) + '[sp]';
+      const speedFilter = current + 'setpts=PTS/' + speedDivisor.toFixed(4) + '[sp_pre]';
       filters.push(speedFilter);
+      filters.push('[sp_pre]null[sp]');
 
       // Color temp burst
-      const tempFilter = '[sp]eq=color_temperature=' + colorTemp.toFixed(4) + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct]';
+      const tempFilter = '[sp]eq=color_temperature=' + colorTemp.toFixed(4) + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct_pre]';
       filters.push(tempFilter);
+      filters.push('[ct_pre]null[ct]');
 
       // Vignette burst (PI/4 angle, variable amount)
-      const vigFilter = '[ct]vignette=PI/4:' + vignetteVal.toFixed(4) + ':eval=frame:enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[vg]';
+      const vigFilter = '[ct]vignette=PI/4:' + vignetteVal.toFixed(4) + ':eval=frame:enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[vg_pre]';
       filters.push(vigFilter);
+      filters.push('[vg_pre]null[vg]');
 
       // Text overlay (one auto-generated line from caption, centered)
       const captionLines = (youtube.caption || '').trim().split('\n');
       const textLine = (captionLines.length > 1 ? captionLines[Math.floor(Math.random() * captionLines.length)] : captionLines[0] || '✨').substring(0, 50);
       // Escape single quotes in text for FFmpeg drawtext
       const safeText = textLine.replace(/'/g, "'\\\\\\''").replace(/"/g, '\\"');
-      const txtFilter = '[vg]drawtext=text=\'' + safeText + '\':x=(w-text_w)/2:y=h*0.4:fontsize=28:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[tx]';
+      const txtFilter = '[vg]drawtext=text=\'' + safeText + '\':x=(w-text_w)/2:y=h*0.4:fontsize=28:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[tx_pre]';
       filters.push(txtFilter);
+      filters.push('[tx_pre]null[tx]');
 
       current = '[tx]';
 
