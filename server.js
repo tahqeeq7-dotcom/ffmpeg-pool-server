@@ -158,6 +158,17 @@ function resolveShortcut(fileId, apiKey) {
   });
 }
 
+function getVideoDimensions(filePath) {
+  return new Promise((resolve, reject) => {
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', filePath], (err, stdout) => {
+      if (err) return reject(err);
+      const [w, h] = (stdout || '').trim().split('x').map(Number);
+      if (!w || !h) return reject(new Error('Could not read dimensions for ' + filePath));
+      resolve({ width: w, height: h });
+    });
+  });
+}
+
 function runFFmpeg(args, timeoutSecs, taskId) {
   return new Promise((resolve, reject) => {
     const child = execFile(FFMPEG_BIN, args, { timeout: timeoutSecs * 1000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -302,9 +313,19 @@ async function processTask(task) {
     const concatLabels = [];
     let inputIdx = 0;
 
-    if (hasHook) { ffmpegArgs.push('-i', path.join(taskDir, 'hook.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++; }
-    ffmpegArgs.push('-i', path.join(taskDir, 'content.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++;
-    if (hasOutro) { ffmpegArgs.push('-i', path.join(taskDir, 'outro.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push('[' + inputIdx + ':v]setpts=PTS-STARTPTS[v' + inputIdx + ']'); inputIdx++; }
+    // concat requires every input to share identical resolution + SAR. Clips coming from
+    // different sources (hook/outro vs content) can differ, which is what caused
+    // "Input link ... parameters do not match the corresponding output link ... parameters".
+    // Normalize everything to content.mp4's own dimensions: scale-to-fit, pad to exact
+    // canvas, force SAR=1.
+    const { width: targetW, height: targetH } = await getVideoDimensions(path.join(taskDir, 'content.mp4'));
+    const normalize = (idx) =>
+      '[' + idx + ':v]scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
+      'pad=' + targetW + ':' + targetH + ':(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,setpts=PTS-STARTPTS[v' + idx + ']';
+
+    if (hasHook) { ffmpegArgs.push('-i', path.join(taskDir, 'hook.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push(normalize(inputIdx)); inputIdx++; }
+    ffmpegArgs.push('-i', path.join(taskDir, 'content.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push(normalize(inputIdx)); inputIdx++;
+    if (hasOutro) { ffmpegArgs.push('-i', path.join(taskDir, 'outro.mp4')); concatLabels.push('[v' + inputIdx + ']'); filters.push(normalize(inputIdx)); inputIdx++; }
 
     const n = concatLabels.length;
     filters.push(concatLabels.join('') + 'concat=n=' + n + ':v=1:a=0[base]');
