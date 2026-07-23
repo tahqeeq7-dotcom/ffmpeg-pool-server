@@ -505,12 +505,7 @@ async function processQueue() {
   const task = taskQueue.shift();
   activeTasks++;
   try {
-    let result;
-    if (task.folderMode) {
-      result = await processFolderTask(task.data);
-    } else {
-      result = await processTask(task.data);
-    }
+    const result = await processTask(task.data);
     if (result && result.success) vidsToday++;
     if (task.resolve) task.resolve(result);
   } catch (err) {
@@ -526,105 +521,6 @@ async function processQueue() {
   }
 
   setTimeout(() => { try { delete progressMap[task.data.taskId]; } catch (_) {} }, 30000);
-}
-
-// List files in a Drive folder using real Drive API with key rotation
-function listDriveFolderWithRetry(folderId, apiKeys) {
-  return new Promise((resolve) => {
-    const q = "'" + folderId + "' in parents and (mimeType contains 'video/' or mimeType='application/vnd.google-apps.shortcut')";
-    const fields = 'files(id,name,mimeType,shortcutDetails(targetId,targetMimeType))';
-    let idx = 0;
-    function tryNext() {
-      if (idx >= apiKeys.length) return resolve([]);
-      const key = apiKeys[idx++];
-      const path = '/drive/v3/files?q=' + encodeURIComponent(q) + '&key=' + encodeURIComponent(key) + '&fields=' + encodeURIComponent(fields) + '&pageSize=100';
-      const opts = {
-        hostname: 'www.googleapis.com',
-        path: path,
-        method: 'GET',
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      };
-      const req = https.request(opts, (res) => {
-        let body = '';
-        res.on('data', (chunk) => body += chunk);
-        res.on('end', () => {
-          if (res.statusCode === 200) {
-            try { const data = JSON.parse(body); return resolve(data.files || []); }
-            catch (_) { return resolve([]); }
-          }
-          if (res.statusCode === 403) return tryNext();
-          console.log('[DriveList] key #' + idx + ' folder ' + folderId + ': HTTP ' + res.statusCode + ' ' + (body || '').substring(0, 500));
-          return resolve([]);
-        });
-      });
-      req.on('error', () => { console.log('[DriveList] key #' + idx + ' folder ' + folderId + ': network error'); tryNext(); });
-      req.end();
-    }
-    tryNext();
-  });
-}
-
-
-
-async function processFolderTask(task) {
-  const { taskId, sourceFolderId, hookFolderId, outroFolderId, apiKeys, usedFileIds, youtube, watermarkFileId, watermarkIsVideo, logoFileId, logoIsVideo, randomize, randomSeed } = task;
-
-  const allFiles = await listDriveFolderWithRetry(sourceFolderId, apiKeys);
-  if (allFiles.length === 0) {
-    return { success: false, taskId, error: 'No videos found in source Drive folder' };
-  }
-
-  const used = new Set(usedFileIds || []);
-  const unused = allFiles.filter(f => !used.has(f.id));
-  if (unused.length === 0) {
-    return { success: false, taskId, error: 'All source videos have been used already' };
-  }
-
-  const picked = unused[Math.floor(Math.random() * unused.length)];
-  const contentFileId = picked.mimeType === 'application/vnd.google-apps.shortcut'
-    ? (picked.shortcutDetails?.targetId || picked.id)
-    : picked.id;
-
-  let hookFileId = null;
-  if (hookFolderId) {
-    const hookFiles = await listDriveFolderWithRetry(hookFolderId, apiKeys);
-    if (hookFiles.length > 0) {
-      const hf = hookFiles[Math.floor(Math.random() * hookFiles.length)];
-      hookFileId = hf.mimeType === 'application/vnd.google-apps.shortcut'
-        ? (hf.shortcutDetails?.targetId || hf.id)
-        : hf.id;
-    }
-  }
-
-  let outroFileId = null;
-  if (outroFolderId) {
-    const outroFiles = await listDriveFolderWithRetry(outroFolderId, apiKeys);
-    if (outroFiles.length > 0) {
-      const of = outroFiles[0];
-      outroFileId = of.mimeType === 'application/vnd.google-apps.shortcut'
-        ? (of.shortcutDetails?.targetId || of.id)
-        : of.id;
-    }
-  }
-
-  const processData = {
-    taskId,
-    driveApiKey: apiKeys[0] || '',
-    contentFileId,
-    hookFileId,
-    outroFileId,
-    watermarkFileId,
-    watermarkIsVideo,
-    logoFileId,
-    logoIsVideo,
-    youtube,
-    randomize,
-    randomSeed,
-    skipDownload: false,
-  };
-
-  const result = await processTask(processData);
-  return { ...result, usedContentFileId: contentFileId, usedHookFileId: hookFileId };
 }
 
 // ─── HTTP Endpoints ──────────────────────────────────────────
@@ -666,21 +562,6 @@ app.post('/process', (req, res) => {
     if (activeTasks < getMaxWorkers()) processQueue();
   });
 
-  resolver.then((result) => res.json(result));
-});
-
-app.post('/process-folder', (req, res) => {
-  const { taskId, sourceFolderId, apiKeys } = req.body;
-  if (!taskId || !sourceFolderId || !apiKeys || !apiKeys.length) {
-    return res.status(400).json({ success: false, taskId: taskId || '?', error: 'Missing required fields: taskId, sourceFolderId, apiKeys' });
-  }
-  if (taskQueue.length >= MAX_QUEUE_LENGTH) {
-    return res.status(429).json({ success: false, taskId, error: 'Server queue full (max ' + MAX_QUEUE_LENGTH + '). Try again later.' });
-  }
-  const resolver = new Promise((resolve) => {
-    taskQueue.push({ data: req.body, resolve, folderMode: true });
-    if (activeTasks < getMaxWorkers()) processQueue();
-  });
   resolver.then((result) => res.json(result));
 });
 
