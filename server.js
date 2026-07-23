@@ -128,7 +128,7 @@ function downloadFile(urlStr, destPath, taskId, { fileId, apiKey } = {}) {
 }
 
 function driveUrl(fileId, apiKey) {
-  return 'https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media&key=' + apiKey;
+  return 'https://drive.google.com/uc?export=download&confirm=1&id=' + fileId;
 }
 
 // Resolve a Google Drive shortcut to its target file ID.
