@@ -525,38 +525,6 @@ async function processQueue() {
   setTimeout(() => { try { delete progressMap[task.data.taskId]; } catch (_) {} }, 30000);
 }
 
-// List files in a public Google Drive folder by scraping the folder page.
-function listDriveFolder(folderId) {
-  return new Promise((resolve, reject) => {
-    const url = 'https://drive.google.com/drive/folders/' + encodeURIComponent(folderId);
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      let html = '';
-      res.on('data', (chunk) => html += chunk);
-      res.on('end', () => {
-        try {
-          const files = [];
-          const re = /"id":"([a-zA-Z0-9_-]+)"[^}]*"name":"([^"]+)"[^}]*"mimeType":"(video\/[^"]+|application\/vnd\.google-apps\.shortcut)"/g;
-          let match;
-          while ((match = re.exec(html)) !== null) {
-            const mime = match[3];
-            if (mime.includes('video/') || mime === 'application/vnd.google-apps.shortcut') {
-              if (!files.some(f => f.id === match[1])) {
-                files.push({ id: match[1], name: match[2], mimeType: mime });
-              }
-            }
-          }
-          resolve(files);
-        } catch (e) {
-          resolve([]);
-        }
-      });
-    }).on('error', (err) => {
-      console.error('listDriveFolder request failed:', err.message);
-      resolve([]);
-    });
-  });
-}
-
 // ─── HTTP Endpoints ──────────────────────────────────────────
 app.get('/health', (req, res) => {
   resetDaily();
@@ -597,18 +565,6 @@ app.post('/process', (req, res) => {
   });
 
   resolver.then((result) => res.json(result));
-});
-
-// List files in a public Drive folder (fallback for when app's Drive API 403s)
-app.get('/list-folder', async (req, res) => {
-  const { folderId } = req.query;
-  if (!folderId) return res.status(400).json({ success: false, error: 'Missing folderId query param' });
-  try {
-    const files = await listDriveFolder(folderId);
-    res.json({ success: true, files });
-  } catch (e) {
-    res.json({ success: false, error: e.message, files: [] });
-  }
 });
 
 // ─── Graceful shutdown ───────────────────────────────────────
