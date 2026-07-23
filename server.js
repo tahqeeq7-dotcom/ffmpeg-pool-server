@@ -76,7 +76,7 @@ function getMaxWorkers() {
   return Math.min(byRAM, byCPU, 6);
 }
 
-function downloadFile(urlStr, destPath, taskId, { fileId, apiKey, driveToken } = {}) {
+function downloadFile(urlStr, destPath, taskId, { fileId, apiKey } = {}) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
     const parsed = new URL(urlStr);
@@ -97,12 +97,10 @@ function downloadFile(urlStr, destPath, taskId, { fileId, apiKey, driveToken } =
       // If download fails or returns HTML, attempt shortcut resolution
       if (res.statusCode !== 200 || (res.headers['content-type'] || '').includes('text/html')) {
         file.close(); fs.unlink(destPath, () => {});
-        const auth = driveToken || apiKey;
-        const useBearer = !!driveToken;
-        if (fileId && auth) {
-          return resolveShortcut(fileId, auth, useBearer).then((resolvedId) => {
+        if (fileId && apiKey) {
+          return resolveShortcut(fileId, apiKey).then((resolvedId) => {
             if (resolvedId !== fileId) {
-              const newUrl = driveUrl(resolvedId, auth);
+              const newUrl = driveUrl(resolvedId, apiKey);
               console.log('Resolved shortcut', fileId, '->', resolvedId, 'retrying download');
               return downloadFile(newUrl, destPath, taskId).then(resolve).catch(reject);
             }
@@ -134,21 +132,10 @@ function driveUrl(fileId, apiKey) {
 }
 
 // Resolve a Google Drive shortcut to its target file ID.
-// Accepts either apiKey or Bearer token for auth.
-function resolveShortcut(fileId, apiKeyOrToken, useBearer) {
+function resolveShortcut(fileId, apiKey) {
   return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: 'www.googleapis.com',
-      path: '/drive/v3/files/' + fileId + '?fields=mimeType,shortcutDetails(targetId,targetMimeType)',
-      method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-    };
-    if (useBearer) {
-      opts.headers['Authorization'] = 'Bearer ' + apiKeyOrToken;
-    } else {
-      opts.path += '&key=' + encodeURIComponent(apiKeyOrToken);
-    }
-    const req = https.request(opts, (res) => {
+    const url = 'https://www.googleapis.com/drive/v3/files/' + fileId + '?fields=mimeType,shortcutDetails(targetId,targetMimeType)&key=' + encodeURIComponent(apiKey);
+    https.get(url, (res) => {
       let body = '';
       res.on('data', (chunk) => body += chunk);
       res.on('end', () => {
@@ -165,9 +152,7 @@ function resolveShortcut(fileId, apiKeyOrToken, useBearer) {
           resolve(fileId);
         } catch (e) { reject(e); }
       });
-    });
-    req.on('error', reject);
-    req.end();
+    }).on('error', reject);
   });
 }
 
@@ -283,7 +268,7 @@ function seedrandom(seed) {
 }
 
 async function processTask(task) {
-  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, watermarkIsVideo, logoFileId, logoIsVideo, youtube, skipDownload, localVideoPath, randomize, randomSeed, driveToken } = task;
+  const { taskId, driveApiKey, contentFileId, hookFileId, outroFileId, watermarkFileId, watermarkIsVideo, logoFileId, logoIsVideo, youtube, skipDownload, localVideoPath, randomize, randomSeed } = task;
   const taskDir = path.join(TMP_DIR, 'task_' + taskId);
 
   try {
@@ -316,7 +301,7 @@ async function processTask(task) {
         downloads.push({ key: 'logo', url: driveUrl(logoFileId, driveApiKey), file: path.join(taskDir, 'logo.' + (logoIsVideo ? 'mp4' : 'png')), fileId: logoFileId });
       }
 
-      for (const d of downloads) if (d.url) await downloadFile(d.url, d.file, taskId, { fileId: d.fileId, apiKey: driveApiKey, driveToken });
+      for (const d of downloads) if (d.url) await downloadFile(d.url, d.file, taskId, { fileId: d.fileId, apiKey: driveApiKey });
     }
 
     const hasHook = hookFileId && fs.existsSync(path.join(taskDir, 'hook.mp4'));
@@ -579,49 +564,12 @@ function listDriveFolderWithRetry(folderId, apiKeys) {
   });
 }
 
-// List files in a Drive folder using OAuth Bearer token
-function listDriveFolderWithToken(folderId, token) {
-  return new Promise((resolve) => {
-    const q = "'" + folderId + "' in parents and (mimeType contains 'video/' or mimeType='application/vnd.google-apps.shortcut')";
-    const fields = 'files(id,name,mimeType,shortcutDetails(targetId,targetMimeType))';
-    const path = '/drive/v3/files?q=' + encodeURIComponent(q) + '&fields=' + encodeURIComponent(fields) + '&pageSize=100';
-    const opts = {
-      hostname: 'www.googleapis.com',
-      path: path,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Authorization': 'Bearer ' + token,
-      },
-    };
-    const req = https.request(opts, (res) => {
-      let body = '';
-      res.on('data', (chunk) => body += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          try { const data = JSON.parse(body); return resolve(data.files || []); }
-          catch (_) { return resolve([]); }
-        }
-        console.log('[DriveList] OAuth folder ' + folderId + ': HTTP ' + res.statusCode + ' ' + (body || '').substring(0, 500));
-        return resolve([]);
-      });
-    });
-    req.on('error', (err) => { console.log('[DriveList] OAuth folder ' + folderId + ': network error', err.message); resolve([]); });
-    req.end();
-  });
-}
+
 
 async function processFolderTask(task) {
-  const { taskId, sourceFolderId, hookFolderId, outroFolderId, apiKeys, usedFileIds, youtube, watermarkFileId, watermarkIsVideo, logoFileId, logoIsVideo, randomize, randomSeed, driveToken } = task;
+  const { taskId, sourceFolderId, hookFolderId, outroFolderId, apiKeys, usedFileIds, youtube, watermarkFileId, watermarkIsVideo, logoFileId, logoIsVideo, randomize, randomSeed } = task;
 
-  let allFiles = [];
-  // Try OAuth Bearer token first, fall back to API keys
-  if (driveToken && driveToken.length > 0) {
-    allFiles = await listDriveFolderWithToken(sourceFolderId, driveToken);
-  }
-  if (allFiles.length === 0) {
-    allFiles = await listDriveFolderWithRetry(sourceFolderId, apiKeys);
-  }
+  const allFiles = await listDriveFolderWithRetry(sourceFolderId, apiKeys);
   if (allFiles.length === 0) {
     return { success: false, taskId, error: 'No videos found in source Drive folder' };
   }
@@ -639,13 +587,7 @@ async function processFolderTask(task) {
 
   let hookFileId = null;
   if (hookFolderId) {
-    let hookFiles = [];
-    if (driveToken && driveToken.length > 0) {
-      hookFiles = await listDriveFolderWithToken(hookFolderId, driveToken);
-    }
-    if (hookFiles.length === 0) {
-      hookFiles = await listDriveFolderWithRetry(hookFolderId, apiKeys);
-    }
+    const hookFiles = await listDriveFolderWithRetry(hookFolderId, apiKeys);
     if (hookFiles.length > 0) {
       const hf = hookFiles[Math.floor(Math.random() * hookFiles.length)];
       hookFileId = hf.mimeType === 'application/vnd.google-apps.shortcut'
@@ -656,13 +598,7 @@ async function processFolderTask(task) {
 
   let outroFileId = null;
   if (outroFolderId) {
-    let outroFiles = [];
-    if (driveToken && driveToken.length > 0) {
-      outroFiles = await listDriveFolderWithToken(outroFolderId, driveToken);
-    }
-    if (outroFiles.length === 0) {
-      outroFiles = await listDriveFolderWithRetry(outroFolderId, apiKeys);
-    }
+    const outroFiles = await listDriveFolderWithRetry(outroFolderId, apiKeys);
     if (outroFiles.length > 0) {
       const of = outroFiles[0];
       outroFileId = of.mimeType === 'application/vnd.google-apps.shortcut'
@@ -674,7 +610,6 @@ async function processFolderTask(task) {
   const processData = {
     taskId,
     driveApiKey: apiKeys[0] || '',
-    driveToken: driveToken || '',
     contentFileId,
     hookFileId,
     outroFileId,
