@@ -422,8 +422,10 @@ async function processTask(task) {
       const bStart = burstStart.toFixed(3);
       const bEnd = burstEnd.toFixed(3);
 
-      // Color temp burst
-      const tempFilter = current + 'eq=color_temperature=' + colorTemp.toFixed(4) + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct_pre]';
+      // Color temp burst (colorchannelmixer works on all FFmpeg builds unlike custom eq=color_temperature)
+      const cr = (1.0 + colorTemp * 1.5).toFixed(4);
+      const cb = (1.0 - colorTemp * 1.5).toFixed(4);
+      const tempFilter = current + 'colorchannelmixer=rr=' + cr + ':bb=' + cb + ':enable=\'between(t,' + burstStart.toFixed(1) + ',' + burstEnd.toFixed(1) + ')\'[ct_pre]';
       filters.push(tempFilter);
       filters.push('[ct_pre]null[ct]');
 
